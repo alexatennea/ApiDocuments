@@ -19,8 +19,8 @@ jobs:
   build:
     name: Build API
     runs-on: ubuntu-latest
-
-    steps:
+    permissions:
+      contents: read
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -52,6 +52,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     needs: build
+    permissions:
+      contents: read
 
     defaults:
       run:
@@ -125,6 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     needs: terraform
+    permissions: {}
 
     steps:
       - name: Download artifact
