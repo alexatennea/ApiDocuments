@@ -1,0 +1,146 @@
+name: Deploy – Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_deploy:
+        description: 'Type "deploy" to confirm production deployment'
+        required: true
+        default: ''
+
+env:
+  DOTNET_VERSION: '10.0.x'
+  BUILD_CONFIGURATION: Release
+  TF_WORKING_DIR: terraform
+  ENVIRONMENT: prod
+
+jobs:
+  validate-input:
+    name: Validate deployment confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm deployment input
+        if: ${{ github.event.inputs.confirm_deploy != 'deploy' }}
+        run: |
+          echo "Deployment not confirmed. Please type 'deploy' in the confirmation field."
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Build
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build API
+    runs-on: ubuntu-latest
+    needs: validate-input
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore, build, test
+        run: |
+          dotnet restore
+          dotnet build --configuration ${{ env.BUILD_CONFIGURATION }} --no-restore
+          dotnet test --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --verbosity normal
+
+      - name: Publish API
+        run: dotnet publish src/ApiDocuments.Api/ApiDocuments.Api.csproj --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --output ./publish
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-prod
+          path: ./publish
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Terraform (infrastructure)
+  # ─────────────────────────────────────────────────────────────────────────────
+  terraform:
+    name: Terraform – Prod
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: build
+
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=${{ env.ENVIRONMENT }}.terraform.tfstate"
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var-file="environments/${{ env.ENVIRONMENT }}.tfvars" \
+            -var="sql_admin_username=${{ secrets.SQL_ADMIN_USERNAME }}" \
+            -var="sql_admin_password=${{ secrets.SQL_ADMIN_PASSWORD }}" \
+            -out=tfplan
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        env:
+          ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Deploy
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy API – Prod
+    runs-on: ubuntu-latest
+    environment: prod
+    needs: terraform
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: api-prod
+          path: ./publish
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: apidocs-prod-api
+          package: ./publish
